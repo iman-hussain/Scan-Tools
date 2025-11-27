@@ -8,18 +8,10 @@ cd /d "%~dp0"
 
 REM Auto-update from GitHub
 echo Checking for updates...
-powershell -ExecutionPolicy Bypass -Command ^
-    "$repo = 'iman-hussain/Scan-Tools'; ^
-    $files = @('Crop Split Rotate Upscale.py', 'requirements.txt'); ^
-    foreach ($file in $files) { ^
-        try { ^
-            $url = \"https://raw.githubusercontent.com/$repo/main/$file\"; ^
-            $temp = \"$file.tmp\"; ^
-            Invoke-WebRequest -Uri $url -OutFile $temp -UseBasicParsing -ErrorAction Stop; ^
-            if (Test-Path $temp) { Move-Item -Force $temp $file } ^
-        } catch { } ^
-    }; ^
-    Write-Host 'Up to date.'"
+powershell -ExecutionPolicy Bypass -File "update.ps1" 2>nul
+if %errorlevel% neq 0 (
+    echo Continuing without update check...
+)
 echo.
 
 REM Check if venv exists
