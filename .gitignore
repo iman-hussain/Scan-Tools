@@ -1,2 +1,26 @@
-#ignore the input files
-/Raw_Input/*
+# Virtual environment
+venv/
+
+# Input/Output folders (contain user photos)
+Input/
+Output/
+
+# Downloaded ML models
+models/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log

@@ -4,7 +4,7 @@ Photo Scanner Processing Script
 - Splits scanned images containing multiple photos
 - Crops out black/dark grey scanner background
 - Auto-rotates based on face detection
-- GPU accelerated using DirectML (works with NVIDIA RTX 3060, 2080Ti, etc.)
+- GPU accelerated using DirectML (works with any GPU - NVIDIA, AMD, Intel)
 
 Author: Photo Scanner Assistant
 """
@@ -20,8 +20,9 @@ import urllib.request
 import time
 
 # --- CONFIGURATION ---
-INPUT_DIR = r"D:\Scans\Raw_Input"
-OUTPUT_DIR = r"D:\Scans\Processed_Library"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+INPUT_DIR = os.path.join(SCRIPT_DIR, "Input")
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "Output")
 BG_THRESHOLD = 50          # Threshold for black background detection (lower = darker only)
 MIN_PHOTO_AREA = 50000     # Minimum area to be considered a photo (filters out dust/artifacts)
 MIN_PHOTO_DIMENSION = 400  # Minimum width/height in pixels for a valid photo (standard prints are large)
@@ -61,21 +62,20 @@ try:
     providers = ort.get_available_providers()
     print(f"ONNX Runtime providers: {providers}")
 
-    if 'DmlExecutionProvider' in providers and USE_GPU:
+    if 'CUDAExecutionProvider' in providers and USE_GPU:
+        ONNX_GPU_AVAILABLE = True
+        GPU_PROVIDER = 'CUDAExecutionProvider'
+        print("✓ CUDA GPU acceleration enabled (RTX 2080Ti)")
+    elif 'DmlExecutionProvider' in providers and USE_GPU:
         ONNX_GPU_AVAILABLE = True
         GPU_PROVIDER = 'DmlExecutionProvider'
         print("✓ DirectML GPU acceleration enabled")
-    elif 'CUDAExecutionProvider' in providers and USE_GPU:
-        ONNX_GPU_AVAILABLE = True
-        GPU_PROVIDER = 'CUDAExecutionProvider'
-        print("✓ CUDA GPU acceleration enabled")
     else:
         print("⚠ Running on CPU (no GPU provider available)")
 except ImportError:
     print("⚠ ONNX Runtime not installed, using OpenCV only")
 
 # --- MODEL PATHS ---
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
