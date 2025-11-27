@@ -424,57 +424,95 @@ def apply_rotation(image, angle):
 # STEP 3: DESKEW (STRAIGHTEN TILTED PHOTOS)
 # ============================================================
 
-def deskew(image, max_angle=20):
+def deskew(image, max_angle=25):
     """
-    Detect if image is tilted by finding the photo's edges and straightening.
-    Uses the minimum area bounding rectangle of the photo content.
+    Detect and correct image tilt using multiple methods for best accuracy.
+    Combines: minAreaRect, Hough lines on edges, and gradient analysis.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     
-    # Method 1: Find the photo rectangle using thresholding
-    # The photo content should be brighter than any remaining dark border
+    angles_detected = []
+    
+    # === METHOD 1: MinAreaRect of photo content ===
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Try to find the photo edges
     _, binary = cv2.threshold(blurred, 50, 255, cv2.THRESH_BINARY)
-    
-    # Clean up
     kernel = np.ones((5, 5), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
     
-    # Find contours
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) > (w * h) * 0.3:  # Must be significant
+            rect = cv2.minAreaRect(largest)
+            angle1 = rect[2]
+            rect_w, rect_h = rect[1]
+            if rect_w < rect_h:
+                angle1 = angle1 + 90
+            if abs(angle1) <= max_angle:
+                angles_detected.append(('minAreaRect', angle1, 3))  # weight 3
     
-    if not contours:
+    # === METHOD 2: Hough lines on photo edges ===
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    
+    # Dilate edges slightly to connect broken lines
+    edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+    
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=60,
+                            minLineLength=min(w, h) // 8, maxLineGap=15)
+    
+    if lines is not None and len(lines) > 0:
+        line_angles = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            length = math.sqrt((x2-x1)**2 + (y2-y1)**2)
+            
+            # Weight longer lines more
+            if length < 50:
+                continue
+            
+            angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+            
+            # Normalize to -45 to 45
+            while angle > 45:
+                angle -= 90
+            while angle < -45:
+                angle += 90
+            
+            # Weight by line length
+            line_angles.extend([angle] * int(length / 50))
+        
+        if line_angles:
+            angle2 = np.median(line_angles)
+            if abs(angle2) <= max_angle:
+                angles_detected.append(('hough', angle2, 2))
+    
+    # === METHOD 3: Border edge analysis ===
+    # Look at the edges of the image specifically
+    border_angle = detect_border_angle(gray)
+    if border_angle is not None and abs(border_angle) <= max_angle:
+        angles_detected.append(('border', border_angle, 4))  # Highest weight
+    
+    # === METHOD 4: Gradient orientation (for subtle tilts) ===
+    gradient_angle = detect_gradient_angle(gray)
+    if gradient_angle is not None and abs(gradient_angle) <= max_angle:
+        angles_detected.append(('gradient', gradient_angle, 1))
+    
+    if not angles_detected:
         return image
     
-    # Get the largest contour (should be the photo)
-    largest = max(contours, key=cv2.contourArea)
+    # Combine angles using weighted average
+    total_weight = sum(a[2] for a in angles_detected)
+    weighted_angle = sum(a[1] * a[2] for a in angles_detected) / total_weight
     
-    # Get minimum area rectangle - this gives us the angle!
-    rect = cv2.minAreaRect(largest)
-    angle = rect[2]
-    rect_w, rect_h = rect[1]
+    # Only correct if angle is noticeable (> 0.3 degrees)
+    if abs(weighted_angle) < 0.3:
+        return image
     
-    # Normalize angle based on rectangle orientation
-    # minAreaRect returns angles in range [-90, 0)
-    if rect_w < rect_h:
-        angle = angle + 90
-    
-    # Only correct reasonable angles
-    if abs(angle) < 0.5 or abs(angle) > max_angle:
-        # Try method 2: Hough lines on edges
-        angle = detect_skew_from_lines(gray)
-        if angle is None or abs(angle) < 0.5 or abs(angle) > max_angle:
-            return image
-    
-    # Rotate to straighten
+    # Apply rotation
     center = (w // 2, h // 2)
-    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    matrix = cv2.getRotationMatrix2D(center, weighted_angle, 1.0)
     
-    # Calculate new bounds to fit rotated image
     cos = abs(matrix[0, 0])
     sin = abs(matrix[0, 1])
     new_w = int(h * sin + w * cos)
@@ -483,57 +521,218 @@ def deskew(image, max_angle=20):
     matrix[0, 2] += (new_w - w) / 2
     matrix[1, 2] += (new_h - h) / 2
     
-    # Use white border for rotation (will be trimmed anyway)
     rotated = cv2.warpAffine(image, matrix, (new_w, new_h),
-                              borderMode=cv2.BORDER_REPLICATE)
+                              borderMode=cv2.BORDER_CONSTANT, 
+                              borderValue=(0, 0, 0))  # Black border for detection
     
-    # Trim any edges created by rotation
-    return trim_dark_borders(rotated)
+    # Now crop to the largest rectangle inside the rotated image
+    # This removes the triangular artifacts from rotation
+    cropped = crop_to_content_rectangle(rotated)
+    
+    return cropped
 
 
-def detect_skew_from_lines(gray):
-    """Backup method: detect skew angle from Hough lines."""
+def crop_to_content_rectangle(image):
+    """
+    After rotation, crop to the largest axis-aligned rectangle 
+    containing only photo content (no black rotation artifacts).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     
-    # Edge detection
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    # Find the content (non-black areas)
+    _, binary = cv2.threshold(gray, 15, 255, cv2.THRESH_BINARY)
     
-    # Detect lines
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80,
-                            minLineLength=min(w, h) // 6, maxLineGap=10)
+    # Find contours
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    if lines is None or len(lines) < 3:
-        return None
+    if not contours:
+        return image
     
-    # Calculate angles of detected lines
+    # Get the largest contour
+    largest = max(contours, key=cv2.contourArea)
+    
+    # Get bounding rect
+    x, y, cw, ch = cv2.boundingRect(largest)
+    
+    # Now find the largest rectangle INSIDE the content
+    # We need to avoid the black triangular corners from rotation
+    
+    # Create a mask of the content
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(mask, [largest], -1, 255, -1)
+    
+    # Find the largest inscribed rectangle
+    # Start from bounding rect and shrink until all corners are inside content
+    x1, y1, x2, y2 = x, y, x + cw, y + ch
+    
+    # Shrink from each side until we're fully inside the photo
+    margin = 5
+    
+    # Check corners and shrink iteratively
+    for _ in range(50):  # Max iterations
+        corners_ok = True
+        
+        # Check if corners are in content (not black)
+        test_points = [
+            (x1 + margin, y1 + margin),
+            (x2 - margin, y1 + margin),
+            (x1 + margin, y2 - margin),
+            (x2 - margin, y2 - margin),
+        ]
+        
+        for px, py in test_points:
+            px = max(0, min(w-1, int(px)))
+            py = max(0, min(h-1, int(py)))
+            if mask[py, px] == 0:
+                corners_ok = False
+                break
+        
+        if corners_ok:
+            break
+        
+        # Shrink all sides slightly
+        x1 += 3
+        y1 += 3
+        x2 -= 3
+        y2 -= 3
+        
+        if x2 - x1 < 100 or y2 - y1 < 100:
+            # Don't shrink too much
+            x1, y1, x2, y2 = x, y, x + cw, y + ch
+            break
+    
+    # Ensure bounds are valid
+    x1 = max(0, int(x1))
+    y1 = max(0, int(y1))
+    x2 = min(w, int(x2))
+    y2 = min(h, int(y2))
+    
+    if x2 - x1 < 100 or y2 - y1 < 100:
+        return image
+    
+    return image[y1:y2, x1:x2]
+
+
+def detect_border_angle(gray):
+    """
+    Detect angle by analyzing the borders of the image.
+    Looks for the transition from dark border to photo content.
+    """
+    h, w = gray.shape
+    
+    # Sample the edges to find where the photo content starts
+    # This works well when there's still some dark border visible
+    
+    edges = []
+    
+    # Top edge: scan down to find first bright row
+    for x in range(w // 4, 3 * w // 4, w // 20):
+        for y in range(min(h // 4, 100)):
+            if gray[y, x] > 60:
+                edges.append((x, y, 'top'))
+                break
+    
+    # Bottom edge: scan up
+    for x in range(w // 4, 3 * w // 4, w // 20):
+        for y in range(h - 1, max(h - h // 4, h - 100), -1):
+            if gray[y, x] > 60:
+                edges.append((x, y, 'bottom'))
+                break
+    
+    # Left edge: scan right
+    for y in range(h // 4, 3 * h // 4, h // 20):
+        for x in range(min(w // 4, 100)):
+            if gray[y, x] > 60:
+                edges.append((x, y, 'left'))
+                break
+    
+    # Right edge: scan left
+    for y in range(h // 4, 3 * h // 4, h // 20):
+        for x in range(w - 1, max(w - w // 4, w - 100), -1):
+            if gray[y, x] > 60:
+                edges.append((x, y, 'right'))
+                break
+    
+    # Fit lines to top/bottom edges
     angles = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        length = math.sqrt((x2-x1)**2 + (y2-y1)**2)
-        
-        # Only consider longer lines (more reliable)
-        if length < min(w, h) // 8:
-            continue
-        
-        if abs(x2 - x1) < 3:
-            # Nearly vertical line
-            angle = 90 if (y2 > y1) else -90
-        else:
-            angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
-        
-        # Normalize to -45 to 45 (we want to detect small tilts)
-        while angle > 45:
-            angle -= 90
-        while angle < -45:
-            angle += 90
-        
-        angles.append(angle)
+    
+    top_points = [(e[0], e[1]) for e in edges if e[2] == 'top']
+    if len(top_points) >= 3:
+        xs = [p[0] for p in top_points]
+        ys = [p[1] for p in top_points]
+        if max(xs) - min(xs) > 50:  # Need spread
+            slope, _ = np.polyfit(xs, ys, 1)
+            angles.append(math.degrees(math.atan(slope)))
+    
+    bottom_points = [(e[0], e[1]) for e in edges if e[2] == 'bottom']
+    if len(bottom_points) >= 3:
+        xs = [p[0] for p in bottom_points]
+        ys = [p[1] for p in bottom_points]
+        if max(xs) - min(xs) > 50:
+            slope, _ = np.polyfit(xs, ys, 1)
+            angles.append(math.degrees(math.atan(slope)))
+    
+    left_points = [(e[0], e[1]) for e in edges if e[2] == 'left']
+    if len(left_points) >= 3:
+        xs = [p[0] for p in left_points]
+        ys = [p[1] for p in left_points]
+        if max(ys) - min(ys) > 50:
+            # For vertical lines, swap x and y
+            slope, _ = np.polyfit(ys, xs, 1)
+            angle = math.degrees(math.atan(slope))
+            angles.append(angle)
+    
+    right_points = [(e[0], e[1]) for e in edges if e[2] == 'right']
+    if len(right_points) >= 3:
+        xs = [p[0] for p in right_points]
+        ys = [p[1] for p in right_points]
+        if max(ys) - min(ys) > 50:
+            slope, _ = np.polyfit(ys, xs, 1)
+            angle = math.degrees(math.atan(slope))
+            angles.append(angle)
     
     if not angles:
         return None
     
-    # Use median angle (robust to outliers)
     return np.median(angles)
+
+
+def detect_gradient_angle(gray):
+    """
+    Detect angle using image gradients - good for subtle tilts.
+    """
+    h, w = gray.shape
+    
+    # Compute gradients
+    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
+    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
+    
+    # Find strong gradient points (edges)
+    magnitude = np.sqrt(gx**2 + gy**2)
+    threshold = np.percentile(magnitude, 90)
+    
+    strong_points = magnitude > threshold
+    
+    # Get angles at strong gradient points
+    angles = np.arctan2(gy[strong_points], gx[strong_points])
+    angles = np.degrees(angles)
+    
+    # We want horizontal/vertical lines, so look for angles near 0, 90, -90, 180
+    # Normalize to -45 to 45
+    normalized = []
+    for a in angles:
+        while a > 45:
+            a -= 90
+        while a < -45:
+            a += 90
+        normalized.append(a)
+    
+    if not normalized:
+        return None
+    
+    # Use median
+    return np.median(normalized)
 
 
 # ============================================================
