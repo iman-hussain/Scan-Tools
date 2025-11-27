@@ -39,7 +39,7 @@ MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Config
-TEST_MODE = True  # Process limited files for testing
+TEST_MODE = False  # Process limited files for testing
 TEST_LIMIT = 10
 UPSCALE_2X = True  # AI upscale photos by 2x using Real-ESRGAN
 PARALLEL_WORKERS = 8  # Number of parallel workers
