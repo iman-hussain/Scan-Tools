@@ -39,8 +39,6 @@ MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Config
-TEST_MODE = False  # Process limited files for testing
-TEST_LIMIT = 10
 UPSCALE_2X = True  # AI upscale photos by 2x using Real-ESRGAN
 PARALLEL_WORKERS = 8  # Number of parallel workers
 
@@ -927,9 +925,6 @@ def process_all():
     print(f"Input:  {INPUT_DIR}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Workers: {PARALLEL_WORKERS}")
-    
-    if TEST_MODE:
-        print(f"*** TEST MODE: {TEST_LIMIT} files ***")
     print()
     
     # Find all input files
@@ -938,9 +933,6 @@ def process_all():
     for ext in extensions:
         files.extend(glob.glob(os.path.join(INPUT_DIR, '**', ext), recursive=True))
     files.sort()
-    
-    if TEST_MODE:
-        files = files[:TEST_LIMIT]
     
     print(f"Found {len(files)} input files.\n")
     
