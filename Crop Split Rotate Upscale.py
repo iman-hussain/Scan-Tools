@@ -1,5 +1,5 @@
 """
-Photo Scanner Processing Script v4.0
+Photo Scanner Processing Script v4.2 (Parallel)
 =====================================
 Simple, clear workflow:
 1. Load input image
@@ -19,6 +19,8 @@ from PIL import Image, ImageOps
 import urllib.request
 import time
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Suppress warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -37,12 +39,17 @@ MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Config
-TEST_MODE = True  # Process all files
-TEST_LIMIT = 20
+TEST_MODE = True  # Process limited files for testing
+TEST_LIMIT = 10
 UPSCALE_2X = True  # AI upscale photos by 2x using Real-ESRGAN
+PARALLEL_WORKERS = 8  # Number of parallel workers
+
+# Thread locks for thread safety
+GPU_LOCK = threading.Lock()      # For Real-ESRGAN GPU operations
+DETECTOR_LOCK = threading.Lock() # For YuNet and Haar (not thread-safe)
 
 print("=" * 60)
-print("PHOTO SCANNER v4.0")
+print("PHOTO SCANNER v4.2 (Parallel)")
 print("=" * 60)
 
 # ============================================================
@@ -396,9 +403,13 @@ def compute_face_score(image):
     Higher score = more likely to be correct orientation.
     Uses confidence-weighted scoring - quality over quantity.
     """
-    yunet_confs = detect_faces_yunet(image)
+    # YuNet and Haar are NOT thread-safe, need lock
+    with DETECTOR_LOCK:
+        yunet_confs = detect_faces_yunet(image)
+        haar_confs = detect_faces_haar(image)
+    
+    # ONNX is thread-safe
     onnx_confs = detect_faces_onnx(image)
-    haar_confs = detect_faces_haar(image)
     
     score = 0.0
     
@@ -815,9 +826,10 @@ def upscale_photo(image):
                 if UPSCALER_DEVICE.type == 'cuda':
                     tile_tensor = tile_tensor.half()
                 
-                # Upscale
-                with torch.no_grad():
-                    upscaled_tensor = UPSCALER(tile_tensor)
+                # Upscale (GPU operation - serialize for VRAM safety)
+                with GPU_LOCK:
+                    with torch.no_grad():
+                        upscaled_tensor = UPSCALER(tile_tensor)
                 
                 # Convert back to numpy
                 upscaled = upscaled_tensor.squeeze(0).permute(1, 2, 0).float().cpu().numpy()
@@ -854,13 +866,67 @@ def save_photo(image, path, do_upscale=True):
     pil_img.save(path, quality=95)
 
 
+def process_single_scan(args):
+    """Process a single scan file. Used for parallel processing."""
+    filepath, out_folder = args
+    filename = os.path.basename(filepath)
+    basename = os.path.splitext(filename)[0]
+    
+    # Load image
+    image = cv2.imread(filepath)
+    if image is None:
+        return {"status": "error", "file": filename, "msg": "Could not load", "photos": 0, "times": []}
+    
+    # STEP 1: Find and split photos
+    photos = find_photos(image)
+    
+    if not photos:
+        return {"status": "skip", "file": filename, "msg": "No photos found", "photos": 0, "times": []}
+    
+    photo_count = 0
+    log_lines = []
+    photo_times = []
+    
+    # Process each photo
+    for i, photo in enumerate(photos, 1):
+        photo_start = time.time()
+        
+        # STEP 2: Deskew (straighten if tilted)
+        photo = deskew(photo)
+        
+        # STEP 3: Find best rotation (faces upright)
+        best_angle, scores = find_best_rotation(photo)
+        
+        # Apply rotation
+        if best_angle != 0:
+            photo = apply_rotation(photo, best_angle)
+        
+        # STEP 4: Save (with upscaling if enabled)
+        out_path = os.path.join(out_folder, f"{basename}_p{i}.png")
+        orig_h, orig_w = photo.shape[:2]
+        save_photo(photo, out_path, do_upscale=UPSCALE_2X)
+        photo_count += 1
+        
+        photo_time = time.time() - photo_start
+        photo_times.append(photo_time)
+        
+        # Log result
+        scores_str = " ".join([f"{a}°:{s[0]:.1f}" for a, s in scores.items()])
+        rot_str = f"→{best_angle}°" if best_angle != 0 else "OK"
+        upscale_str = f" →{orig_w*2}x{orig_h*2}" if UPSCALE_2X and UPSCALER else ""
+        log_lines.append(f"  [{basename}_p{i}] {orig_w}x{orig_h}{upscale_str} {rot_str} ({photo_time:.1f}s) [{scores_str}]")
+    
+    return {"status": "ok", "file": filename, "photos": photo_count, "logs": log_lines, "times": photo_times}
+
+
 def process_all():
-    """Main processing loop."""
+    """Main processing loop with parallel execution."""
     print("=" * 60)
     print("PROCESSING")
     print("=" * 60)
     print(f"Input:  {INPUT_DIR}")
     print(f"Output: {OUTPUT_DIR}")
+    print(f"Workers: {PARALLEL_WORKERS}")
     
     if TEST_MODE:
         print(f"*** TEST MODE: {TEST_LIMIT} files ***")
@@ -884,57 +950,38 @@ def process_all():
     start_time = time.time()
     total_photos = 0
     skipped = 0
+    errors = 0
+    photo_times = []  # Track individual photo processing times
     
-    pbar = tqdm(files, unit="scan")
-    
-    for filepath in pbar:
-        filename = os.path.basename(filepath)
-        basename = os.path.splitext(filename)[0]
-        
-        # Preserve folder structure
+    # Prepare work items (filepath, output_folder)
+    work_items = []
+    for filepath in files:
         rel_path = os.path.relpath(os.path.dirname(filepath), INPUT_DIR)
         out_folder = os.path.join(OUTPUT_DIR, rel_path)
         os.makedirs(out_folder, exist_ok=True)
+        work_items.append((filepath, out_folder))
+    
+    # Process in parallel
+    pbar = tqdm(total=len(work_items), unit="scan")
+    
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+        futures = {executor.submit(process_single_scan, item): item for item in work_items}
         
-        pbar.set_postfix_str(filename[:30])
-        
-        # Load image
-        image = cv2.imread(filepath)
-        if image is None:
-            pbar.write(f"  ✗ Could not load: {filename}")
-            continue
-        
-        # STEP 1: Find and split photos
-        photos = find_photos(image)
-        
-        if not photos:
-            skipped += 1
-            pbar.write(f"  ⚠ No photos found: {filename}")
-            continue
-        
-        # Process each photo
-        for i, photo in enumerate(photos, 1):
-            # STEP 2: Deskew (straighten if tilted)
-            photo = deskew(photo)
+        for future in as_completed(futures):
+            result = future.result()
+            pbar.update(1)
             
-            # STEP 3: Find best rotation (faces upright)
-            best_angle, scores = find_best_rotation(photo)
-            
-            # Apply rotation
-            if best_angle != 0:
-                photo = apply_rotation(photo, best_angle)
-            
-            # STEP 4: Save (with upscaling if enabled)
-            out_path = os.path.join(out_folder, f"{basename}_p{i}.png")
-            orig_h, orig_w = photo.shape[:2]
-            save_photo(photo, out_path, do_upscale=UPSCALE_2X)
-            total_photos += 1
-            
-            # Log result
-            scores_str = " ".join([f"{a}°:{s[0]:.1f}" for a, s in scores.items()])
-            rot_str = f"→{best_angle}°" if best_angle != 0 else "OK"
-            upscale_str = f" →{orig_w*2}x{orig_h*2}" if UPSCALE_2X and UPSCALER else ""
-            pbar.write(f"  [{basename}_p{i}] {orig_w}x{orig_h}{upscale_str} {rot_str} [{scores_str}]")
+            if result["status"] == "ok":
+                total_photos += result["photos"]
+                photo_times.extend(result.get("times", []))
+                for line in result.get("logs", []):
+                    pbar.write(line)
+            elif result["status"] == "skip":
+                skipped += 1
+                pbar.write(f"  ⚠ {result['msg']}: {result['file']}")
+            else:
+                errors += 1
+                pbar.write(f"  ✗ {result['msg']}: {result['file']}")
     
     pbar.close()
     
@@ -945,7 +992,14 @@ def process_all():
     print("=" * 60)
     print(f"Photos saved: {total_photos}")
     print(f"Scans skipped: {skipped}")
-    print(f"Time: {elapsed:.1f}s")
+    if errors:
+        print(f"Errors: {errors}")
+    print(f"Time: {elapsed:.1f}s ({elapsed/len(files):.1f}s/scan)")
+    if photo_times:
+        avg_time = sum(photo_times) / len(photo_times)
+        min_time = min(photo_times)
+        max_time = max(photo_times)
+        print(f"Photo times: avg {avg_time:.1f}s, min {min_time:.1f}s, max {max_time:.1f}s")
 
 
 if __name__ == "__main__":
