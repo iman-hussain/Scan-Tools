@@ -16,7 +16,7 @@ GPU-accelerated batch processing for scanned photos. Automatically extracts, rot
 - 🔄 **Smart rotation** - Uses AI face detection to orient photos correctly
 - 📐 **Deskew/Straighten** - Fixes tilted scans automatically
 - ✂️ **Border removal** - Trims dark borders tightly
-- 🚀 **2x AI Upscaling** - Real-ESRGAN enhancement for crisp, lifelike results
+- 🚀 **2x AI Upscaling** - Real-ESGAN enhancement for crisp, lifelike results
 - 📁 **Preserves folder structure** - Organizes output matching your input folders
 
 ## 🚀 Quick Start
@@ -24,10 +24,12 @@ GPU-accelerated batch processing for scanned photos. Automatically extracts, rot
 ### 1. Install Prerequisites
 
 **Python 3.10+**
+
 - Download from [python.org](https://www.python.org/downloads/)
 - ✅ Check "Add Python to PATH" during installation
 
 **NVIDIA GPU Drivers & CUDA** (required for GPU acceleration)
+
 1. Install latest [NVIDIA GPU Drivers](https://www.nvidia.com/drivers)
 2. Install [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-downloads)
    - Choose your Windows version
@@ -71,6 +73,7 @@ Input/
 Double-click **`start.bat`**
 
 That's it! The script will:
+
 1. Set up a Python virtual environment (first run only)
 2. Install all dependencies automatically
 3. Process your photos
@@ -103,6 +106,7 @@ UPSCALE_2X = True   # Enable/disable AI upscaling
 ## 📋 Scanning Tips
 
 For best results:
+
 - Use a **black cloth** as backdrop on your scanner
 - Place **1-2 photos** per scan
 - Photos can be at any angle - rotation is auto-detected
@@ -111,16 +115,19 @@ For best results:
 ## 🛠️ Troubleshooting
 
 ### "CUDA not available"
+
 - Ensure you have an NVIDIA GPU
 - Install [NVIDIA drivers](https://www.nvidia.com/drivers)
 - The script will still work on CPU but much slower
 
 ### "No photos found"
+
 - Check your scan has a dark background
 - Ensure photos aren't touching the scanner edges
 - Try adjusting the threshold in the script
 
 ### First run is slow
+
 - Dependencies are being downloaded (~2GB for PyTorch + CUDA)
 - ML models are downloaded automatically
 - Subsequent runs will be much faster
@@ -128,6 +135,7 @@ For best results:
 ## 📊 Performance
 
 On RTX 2080 Ti (11GB VRAM):
+
 - ~4-5 seconds per photo with 2x AI upscaling
 - ~1-2 seconds per photo without upscaling
 
