@@ -1,16 +1,18 @@
 """
-Photo Scanner Processing Script
-================================
+Photo Scanner Processing Script v2.0
+=====================================
 Optimized for A4 flatbed scanner with black cloth backdrop.
-- Each scan contains 1 or 2 photos
-- Crops photos from dark background
-- Auto-rotates based on face detection
+- Each scan contains 1-2 photos (standard print sizes)
+- Crops photos from dark background with precise boundaries
+- Corrects skewed angles (photos scanned at weird angles)
+- Auto-rotates to upright based on face detection
 - GPU accelerated using CUDA (RTX 2080Ti)
 
-Author: Photo Scanner Assistant
+Standard photo print sizes (inches): 4x6, 5x7, 6x8, 8x10
 """
 
 import os
+import sys
 import cv2
 import numpy as np
 import glob
@@ -18,6 +20,15 @@ from tqdm import tqdm
 from PIL import Image, ImageOps
 import urllib.request
 import time
+import logging
+
+# === SUPPRESS ALL WARNINGS ===
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['ONNXRUNTIME_LOG_LEVEL'] = '3'  # Suppress ONNX C++ warnings
+logging.getLogger('onnxruntime').setLevel(logging.ERROR)
+
+import warnings
+warnings.filterwarnings('ignore')
 
 # --- CONFIGURATION ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,68 +36,75 @@ INPUT_DIR = os.path.join(SCRIPT_DIR, "Input")
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "Output")
 
 # Scanner-specific settings (A4 flatbed with black cloth)
-BG_THRESHOLD = 55          # Threshold for dark cloth (higher = more tolerant of grey cloth)
-MIN_PHOTO_AREA = 80000     # Minimum photo size in pixels^2
+MIN_PHOTO_AREA = 200000    # Minimum photo area in pixels^2 (about 500x400)
 MAX_PHOTOS_PER_SCAN = 2    # Each scan has 1 or 2 photos
-BORDER_MARGIN = 15         # Pixels to add around detected photo edges
+PHOTO_PADDING = 5          # Extra pixels around detected photo (trim black edges)
 
-# Face detection settings
-DETECTION_CONFIDENCE = 0.4 # Lower = more sensitive detection
+# Standard photo aspect ratios (width/height, either orientation)
+STANDARD_RATIOS = [
+    4/6, 6/4,    # 4x6
+    5/7, 7/5,    # 5x7 
+    6/8, 8/6,    # 6x8
+    8/10, 10/8,  # 8x10
+    3.5/5, 5/3.5, # 3.5x5
+    1.0,         # Square
+]
 
-# Testing (set to True to only process a subset)
-TEST_MODE = True           # Change to False for full processing
-TEST_LIMIT = 20            # Number of files to process in test mode
+# Testing
+TEST_MODE = True
+TEST_LIMIT = 20  # Test first 20 files (includes problematic 14, 15)
 # ---------------------
 
 print("=" * 60)
-print("PHOTO SCANNER PROCESSING SCRIPT")
+print("PHOTO SCANNER v2.0 - GPU Accelerated")
 print("=" * 60)
-print(f"Scanner: A4 flatbed with black cloth backdrop")
-print(f"Photos per scan: 1-2")
 print()
 
-# === GPU / ONNX Runtime Setup (CUDA ONLY) ===
+# === GPU Setup ===
 ONNX_GPU_AVAILABLE = False
-GPU_PROVIDER = None
 ort = None
 
 try:
     import onnxruntime as ort
+    # Suppress ONNX logging
+    ort.set_default_logger_severity(3)  # ERROR level only
+    
     providers = ort.get_available_providers()
-    print(f"ONNX Runtime providers: {providers}")
-
     if 'CUDAExecutionProvider' in providers:
         ONNX_GPU_AVAILABLE = True
-        GPU_PROVIDER = 'CUDAExecutionProvider'
-        print("✓ CUDA GPU acceleration enabled (RTX 2080Ti)")
+        print("✓ CUDA GPU acceleration enabled")
     else:
-        print("✗ CUDA not available - check CUDA 12.6 installation")
-        print("  Make sure CUDA bin folder is in PATH")
+        print("✗ CUDA not available")
 except ImportError:
     print("✗ ONNX Runtime not installed")
 
-# === CuPy for GPU image operations ===
+# CuPy for GPU image ops
 CUPY_AVAILABLE = False
-cp = None
 try:
     import cupy as cp
     cp.cuda.runtime.getDeviceCount()
     CUPY_AVAILABLE = True
-    gpu_name = cp.cuda.runtime.getDeviceProperties(0)['name'].decode()
-    print(f"✓ CuPy GPU acceleration enabled ({gpu_name})")
-except Exception as e:
-    print(f"⚠ CuPy not available (using CPU for image ops)")
+    print("✓ CuPy GPU acceleration enabled")
+except:
+    pass
 
 # --- MODEL PATHS ---
 MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
+# RetinaFace - heavy/accurate face detection
+RETINAFACE_MODEL_PATH = os.path.join(MODELS_DIR, "retinaface_resnet50.onnx")
+RETINAFACE_URL = "https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_Resnet50_Final.pth"
+
+# YuNet - fast face detection
 YUNET_MODEL_PATH = os.path.join(MODELS_DIR, "face_detection_yunet_2023mar.onnx")
 YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
+# Ultra-Light ONNX
 ULTRAFACE_MODEL_PATH = os.path.join(MODELS_DIR, "version-RFB-320.onnx")
 ULTRAFACE_URL = "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/ultraface/models/version-RFB-320.onnx"
 
+# SSD ResNet
 DNN_PROTO_PATH = os.path.join(MODELS_DIR, "deploy.prototxt")
 DNN_MODEL_PATH = os.path.join(MODELS_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
 DNN_PROTO_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
@@ -99,7 +117,6 @@ def download_model(url, path, name):
         print(f"  Downloading {name}...")
         try:
             urllib.request.urlretrieve(url, path)
-            print(f"  ✓ Downloaded {name}")
             return True
         except Exception as e:
             print(f"  ✗ Could not download {name}: {e}")
@@ -107,169 +124,256 @@ def download_model(url, path, name):
     return True
 
 
-# === Initialize Face Detection Models ===
-print("\nInitializing face detection models...")
+# === Initialize Face Detectors ===
+print("\nLoading face detection models...")
 
-# ONNX Runtime GPU Face Detector
 ONNX_FACE_SESSION = None
 if ort is not None and ONNX_GPU_AVAILABLE:
-    if download_model(ULTRAFACE_URL, ULTRAFACE_MODEL_PATH, "Ultra-Light Face Detector"):
+    if download_model(ULTRAFACE_URL, ULTRAFACE_MODEL_PATH, "Ultra-Light Face"):
         try:
             sess_options = ort.SessionOptions()
             sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_options.log_severity_level = 3  # Suppress warnings
             
             ONNX_FACE_SESSION = ort.InferenceSession(
                 ULTRAFACE_MODEL_PATH,
                 sess_options=sess_options,
-                providers=[GPU_PROVIDER, 'CPUExecutionProvider']
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
             )
-            actual = ONNX_FACE_SESSION.get_providers()[0]
-            print(f"  ✓ ONNX Face Detector loaded ({actual})")
+            print("  ✓ ONNX Face Detector (GPU)")
         except Exception as e:
-            print(f"  ✗ Could not load ONNX face detector: {e}")
+            print(f"  ✗ ONNX Face Detector failed: {e}")
 
-# YuNet face detector (best for orientation)
 YUNET_DETECTOR = None
-if download_model(YUNET_URL, YUNET_MODEL_PATH, "YuNet Face Detector"):
+if download_model(YUNET_URL, YUNET_MODEL_PATH, "YuNet Face"):
     try:
         YUNET_DETECTOR = cv2.FaceDetectorYN.create(
             YUNET_MODEL_PATH, "", (320, 320), 0.5, 0.3, 5000
         )
-        print("  ✓ YuNet Face Detector loaded")
-    except Exception as e:
-        print(f"  ✗ Could not load YuNet: {e}")
+        print("  ✓ YuNet Face Detector")
+    except:
+        pass
 
-# SSD DNN detector (backup)
 DNN_FACE_DETECTOR = None
-if download_model(DNN_PROTO_URL, DNN_PROTO_PATH, "SSD prototxt"):
+if download_model(DNN_PROTO_URL, DNN_PROTO_PATH, "SSD proto"):
     if download_model(DNN_MODEL_URL, DNN_MODEL_PATH, "SSD model"):
         try:
             DNN_FACE_DETECTOR = cv2.dnn.readNetFromCaffe(DNN_PROTO_PATH, DNN_MODEL_PATH)
-            print("  ✓ SSD Face Detector loaded")
-        except Exception as e:
-            print(f"  ✗ Could not load SSD detector: {e}")
+            print("  ✓ SSD Face Detector")
+        except:
+            pass
 
 print()
 
 
 # ============================================================
-# PHOTO EXTRACTION (optimized for black cloth backdrop)
+# PHOTO DETECTION & EXTRACTION
 # ============================================================
 
-def find_photos_in_scan(image):
-    """Find 1-2 photos in scan with black/dark cloth background.
+def analyze_scan_background(gray):
+    """Determine if scan has dark (cloth) or light background."""
+    h, w = gray.shape
     
-    Uses adaptive thresholding to handle varying darkness of the cloth.
-    Returns list of cropped photo images.
+    # Sample corners
+    corners = [
+        gray[0:50, 0:50].mean(),
+        gray[0:50, -50:].mean(),
+        gray[-50:, 0:50].mean(),
+        gray[-50:, -50:].mean(),
+    ]
+    corner_avg = np.mean(corners)
+    
+    # Sample center
+    center = gray[h//3:2*h//3, w//3:2*w//3].mean()
+    
+    # Sample edges (middle of each edge)
+    edge_samples = [
+        gray[h//2, 0:50].mean(),      # left edge
+        gray[h//2, -50:].mean(),      # right edge
+        gray[0:50, w//2].mean(),      # top edge
+        gray[-50:, w//2].mean(),      # bottom edge
+    ]
+    edge_avg = np.mean(edge_samples)
+    
+    # Dark background: edges/corners are dark, there's content in the middle
+    # Light background: everything is light (blank/document scan)
+    if (corner_avg < 100 or edge_avg < 80):
+        return "dark", int(min(corner_avg, edge_avg))
+    elif corner_avg > 150 and center > 150:
+        return "light", int(corner_avg)
+    else:
+        return "dark", int(corner_avg)  # Default to trying to find photos
+
+
+def find_photos_in_scan(image):
+    """
+    Find 1-2 photos in a scan with black cloth background.
+    Uses multiple strategies to detect photo boundaries.
     """
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Apply Gaussian blur to reduce noise from cloth texture
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Analyze background
+    bg_type, bg_level = analyze_scan_background(gray)
     
-    # Try multiple threshold levels to handle varying cloth darkness
-    best_contours = []
-    best_count = 0
+    # If light background (blank/document), skip
+    if bg_type == "light":
+        return []
     
-    for threshold in [BG_THRESHOLD - 15, BG_THRESHOLD, BG_THRESHOLD + 15, BG_THRESHOLD + 30]:
-        if threshold < 20:
+    # Calculate adaptive threshold based on background darkness
+    # Darker cloth = lower threshold needed
+    base_thresh = max(35, min(70, bg_level + 15))
+    
+    # Apply Gaussian blur to smooth cloth texture
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    
+    best_photos = []
+    best_score = 0
+    
+    # Try multiple thresholds
+    for thresh_offset in [-15, -5, 0, 10, 20]:
+        threshold = base_thresh + thresh_offset
+        if threshold < 25 or threshold > 90:
             continue
-            
-        _, thresh = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
         
-        # Morphological operations to clean up
-        kernel = np.ones((5, 5), np.uint8)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        # Binary threshold
+        _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
         
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Clean up with morphological operations
+        kernel = np.ones((7, 7), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        # Filter contours
-        valid = []
+        # Find contours
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter and score contours
+        candidates = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < MIN_PHOTO_AREA:
                 continue
-                
+            
+            # Skip if contour is basically the whole scan
+            if area > (w * h) * 0.9:
+                continue
+            
             x, y, cw, ch = cv2.boundingRect(cnt)
             
-            # Aspect ratio check (photos aren't super skinny)
+            # Aspect ratio check
             aspect = min(cw, ch) / max(cw, ch) if max(cw, ch) > 0 else 0
-            if aspect < 0.3:
+            if aspect < 0.4:  # Photos aren't super skinny
                 continue
             
-            # Size check - photo shouldn't be tiny fraction of scan
-            if area < (w * h) * 0.08:
-                continue
-                
-            valid.append((cnt, area))
+            # Score based on how "photo-like" this contour is
+            # Prefer contours that:
+            # 1. Match standard photo aspect ratios
+            # 2. Are reasonably sized
+            # 3. Have good rectangularity
+            
+            rect_area = cw * ch
+            rectangularity = area / rect_area if rect_area > 0 else 0
+            
+            # Check aspect ratio match to standard photo sizes
+            ratio = cw / ch if ch > 0 else 1
+            ratio_score = min(abs(ratio - r) for r in STANDARD_RATIOS)
+            
+            score = rectangularity * 100 - ratio_score * 50 + (area / (w*h)) * 100
+            
+            candidates.append({
+                'contour': cnt,
+                'bbox': (x, y, cw, ch),
+                'area': area,
+                'score': score,
+                'rect_score': rectangularity
+            })
         
-        # Sort by area and limit to MAX_PHOTOS_PER_SCAN
-        valid.sort(key=lambda x: x[1], reverse=True)
-        valid = valid[:MAX_PHOTOS_PER_SCAN]
+        # Sort by area (largest first), take top 2
+        candidates.sort(key=lambda c: c['area'], reverse=True)
+        candidates = candidates[:MAX_PHOTOS_PER_SCAN]
         
-        # Keep best threshold result (1-2 good contours)
-        if len(valid) >= 1:
-            if len(valid) > best_count or (len(valid) == best_count and len(valid) <= 2):
-                best_contours = valid
-                best_count = len(valid)
+        # Calculate total score for this threshold
+        total_score = sum(c['score'] for c in candidates)
+        
+        if len(candidates) >= 1 and total_score > best_score:
+            best_score = total_score
+            best_photos = candidates
     
-    # Extract photos from best contours
-    photos = []
-    for cnt, _ in best_contours:
-        photo = extract_photo(image, cnt, w, h)
-        if photo is not None:
-            photos.append(photo)
+    # Extract photos
+    results = []
+    for photo_info in best_photos:
+        x, y, cw, ch = photo_info['bbox']
+        cnt = photo_info['contour']
+        
+        # Use minAreaRect for potential angle detection
+        rect = cv2.minAreaRect(cnt)
+        angle = rect[2]
+        
+        # Extract with bounding rect first
+        pad = PHOTO_PADDING
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(w, x + cw + pad)
+        y2 = min(h, y + ch + pad)
+        
+        cropped = image[y1:y2, x1:x2].copy()
+        
+        if cropped.size == 0:
+            continue
+        
+        # Trim any remaining dark borders
+        cropped = trim_dark_edges(cropped)
+        
+        # Check if significantly skewed and correct
+        if cropped is not None and cropped.size > 0:
+            cropped = correct_skew(cropped)
+        
+        if cropped is not None and cropped.size > 0:
+            results.append(cropped)
     
-    return photos
+    return results
 
 
-def extract_photo(image, contour, scan_w, scan_h):
-    """Extract a single photo using bounding rectangle with margin."""
-    x, y, w, h = cv2.boundingRect(contour)
-    
-    # Add margin
-    x1 = max(0, x - BORDER_MARGIN)
-    y1 = max(0, y - BORDER_MARGIN)
-    x2 = min(scan_w, x + w + BORDER_MARGIN)
-    y2 = min(scan_h, y + h + BORDER_MARGIN)
-    
-    cropped = image[y1:y2, x1:x2].copy()
-    
-    if cropped.size == 0:
-        return None
-    
-    # Clean up dark borders
-    cropped = trim_dark_borders(cropped)
-    
-    return cropped
-
-
-def trim_dark_borders(image, threshold=45):
-    """Remove dark borders while preserving photo content."""
+def trim_dark_edges(image, dark_thresh=40):
+    """
+    Precisely trim dark edges from a photo.
+    Uses edge analysis to find the actual photo boundary.
+    """
     if image is None or image.size == 0:
         return image
-        
+    
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     
-    # Find rows/cols where majority is dark
-    row_dark = np.mean(gray < threshold, axis=1)
-    col_dark = np.mean(gray < threshold, axis=0)
+    # Find first/last rows and cols that have substantial bright content
+    # Use percentile to be robust to noise
     
-    # Find first/last non-dark row/col (where less than 70% is dark)
-    valid_rows = np.where(row_dark < 0.7)[0]
-    valid_cols = np.where(col_dark < 0.7)[0]
+    def find_content_start(line_means, thresh=50):
+        """Find first index where content appears."""
+        for i, val in enumerate(line_means):
+            if val > thresh:
+                return max(0, i - 2)  # Small margin
+        return 0
     
-    if len(valid_rows) < 2 or len(valid_cols) < 2:
-        return image
+    def find_content_end(line_means, thresh=50):
+        """Find last index where content appears."""
+        for i in range(len(line_means) - 1, -1, -1):
+            if line_means[i] > thresh:
+                return min(len(line_means), i + 3)  # Small margin
+        return len(line_means)
     
-    y1, y2 = valid_rows[0], valid_rows[-1] + 1
-    x1, x2 = valid_cols[0], valid_cols[-1] + 1
+    # Calculate row and column means
+    row_means = np.mean(gray, axis=1)
+    col_means = np.mean(gray, axis=0)
     
-    # Safety: don't trim more than 15% from any side
-    max_trim = 0.15
+    # Find content bounds
+    y1 = find_content_start(row_means, dark_thresh + 10)
+    y2 = find_content_end(row_means, dark_thresh + 10)
+    x1 = find_content_start(col_means, dark_thresh + 10)
+    x2 = find_content_end(col_means, dark_thresh + 10)
+    
+    # Safety: don't trim more than 10% from any edge
+    max_trim = 0.10
     if y1 > h * max_trim:
         y1 = 0
     if (h - y2) > h * max_trim:
@@ -279,106 +383,177 @@ def trim_dark_borders(image, threshold=45):
     if (w - x2) > w * max_trim:
         x2 = w
     
+    # Ensure we have content
+    if y2 <= y1 or x2 <= x1:
+        return image
+    
     return image[y1:y2, x1:x2]
+
+
+def correct_skew(image, max_angle=15):
+    """
+    Detect and correct skew in photo (for photos scanned at angles).
+    Only corrects small angles (up to max_angle degrees).
+    """
+    if image is None or image.size == 0:
+        return image
+    
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    
+    # Edge detection
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    
+    # Hough line detection
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, 
+                            minLineLength=w//4, maxLineGap=10)
+    
+    if lines is None or len(lines) < 3:
+        return image
+    
+    # Calculate angles of detected lines
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 - x1 == 0:
+            continue
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        # Normalize to -45 to 45 range
+        while angle > 45:
+            angle -= 90
+        while angle < -45:
+            angle += 90
+        angles.append(angle)
+    
+    if not angles:
+        return image
+    
+    # Use median angle (robust to outliers)
+    median_angle = np.median(angles)
+    
+    # Only correct if angle is small but noticeable
+    if abs(median_angle) < 0.5 or abs(median_angle) > max_angle:
+        return image
+    
+    # Rotate to correct skew
+    center = (w // 2, h // 2)
+    matrix = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+    
+    # Calculate new bounding box size
+    cos = np.abs(matrix[0, 0])
+    sin = np.abs(matrix[0, 1])
+    new_w = int(h * sin + w * cos)
+    new_h = int(h * cos + w * sin)
+    
+    # Adjust rotation matrix
+    matrix[0, 2] += (new_w - w) / 2
+    matrix[1, 2] += (new_h - h) / 2
+    
+    # Apply rotation with white border fill
+    rotated = cv2.warpAffine(image, matrix, (new_w, new_h), 
+                              borderMode=cv2.BORDER_REPLICATE)
+    
+    # Trim any new dark edges introduced
+    return trim_dark_edges(rotated)
 
 
 # ============================================================
 # FACE DETECTION
 # ============================================================
 
-def detect_faces_onnx(image, conf=0.5):
-    """CUDA-accelerated face detection."""
+def detect_faces_onnx(image, conf=0.4):
+    """CUDA-accelerated face detection using Ultra-Light model."""
     if ONNX_FACE_SESSION is None:
         return []
-
+    
     h, w = image.shape[:2]
     
+    # Preprocess
     img_resized = cv2.resize(image, (320, 240))
     img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
     img_norm = (img_rgb - 127.0) / 128.0
     img_batch = img_norm.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
-
+    
     input_name = ONNX_FACE_SESSION.get_inputs()[0].name
     confidences, boxes = ONNX_FACE_SESSION.run(None, {input_name: img_batch})
-
+    
     results = []
     for i in range(boxes.shape[1]):
         face_conf = confidences[0, i, 1]
         if face_conf > conf:
-            x1 = max(0, int(boxes[0, i, 0] * w))
-            y1 = max(0, int(boxes[0, i, 1] * h))
-            x2 = min(w, int(boxes[0, i, 2] * w))
-            y2 = min(h, int(boxes[0, i, 3] * h))
-            if x2 - x1 > 10 and y2 - y1 > 10:
-                results.append({'conf': float(face_conf)})
-
+            results.append({'conf': float(face_conf)})
+    
     return results
 
 
-def detect_faces_yunet(image, conf=0.5):
-    """YuNet face detection - most accurate for orientation."""
+def detect_faces_yunet(image, conf=0.4):
+    """YuNet face detection."""
     if YUNET_DETECTOR is None:
         return []
-
+    
     h, w = image.shape[:2]
     YUNET_DETECTOR.setInputSize((w, h))
     _, faces = YUNET_DETECTOR.detect(image)
-
+    
     if faces is None:
         return []
-
+    
     results = []
     for face in faces:
         confidence = float(face[14]) if len(face) > 14 else float(face[-1])
         if confidence >= conf:
             results.append({'conf': confidence})
-
+    
     return results
 
 
-def detect_faces_dnn(image, conf=0.5):
-    """SSD DNN face detection (backup)."""
+def detect_faces_dnn(image, conf=0.4):
+    """SSD DNN face detection."""
     if DNN_FACE_DETECTOR is None:
         return []
-
-    h, w = image.shape[:2]
+    
     blob = cv2.dnn.blobFromImage(image, 1.0, (300, 300), (104.0, 177.0, 123.0))
     DNN_FACE_DETECTOR.setInput(blob)
     detections = DNN_FACE_DETECTOR.forward()
-
+    
     results = []
     for i in range(detections.shape[2]):
         confidence = detections[0, 0, i, 2]
         if confidence > conf:
             results.append({'conf': float(confidence)})
-
+    
     return results
 
 
-def get_rotation_score(image, conf_threshold):
-    """Get face detection score for a single orientation."""
-    faces_yunet = detect_faces_yunet(image, conf_threshold)
-    faces_onnx = detect_faces_onnx(image, conf_threshold)
-    faces_dnn = detect_faces_dnn(image, conf_threshold)
+def count_faces_all_methods(image, conf=0.4):
+    """Get face count using all available methods."""
+    faces = []
     
-    # YuNet is most reliable for orientation, weight it higher
-    score = sum(f['conf'] for f in faces_yunet) * 3.0
-    score += sum(f['conf'] for f in faces_onnx) * 1.0
-    score += sum(f['conf'] for f in faces_dnn) * 1.0
+    # YuNet (most reliable for orientation)
+    yunet_faces = detect_faces_yunet(image, conf)
     
-    # Bonus for number of faces detected
-    total_faces = len(faces_yunet) + len(faces_onnx) + len(faces_dnn)
-    score += total_faces * 0.3
+    # ONNX GPU
+    onnx_faces = detect_faces_onnx(image, conf)
     
-    return score, len(faces_yunet)
+    # SSD backup  
+    dnn_faces = detect_faces_dnn(image, conf)
+    
+    # Weighted score - YuNet is best for orientation detection
+    score = len(yunet_faces) * 3 + len(onnx_faces) * 2 + len(dnn_faces) * 1
+    total = len(yunet_faces) + len(onnx_faces) + len(dnn_faces)
+    
+    return score, total
 
 
-def get_best_rotation(image):
-    """Find the rotation that gives the best face detection results."""
+def find_best_rotation(image):
+    """
+    Find the rotation angle that produces the most face detections.
+    Tests 0°, 90°, 180°, 270° rotations.
+    """
     h, w = image.shape[:2]
     
-    # Scale down for faster detection
-    max_dim = 800
+    # Scale down for faster processing
+    max_dim = 640
     scale = min(1.0, max_dim / max(h, w))
     
     if scale < 1.0:
@@ -388,7 +563,7 @@ def get_best_rotation(image):
     
     best_angle = 0
     best_score = 0
-    best_faces = 0
+    best_count = 0
     
     for angle in [0, 90, 180, 270]:
         if angle == 0:
@@ -400,21 +575,19 @@ def get_best_rotation(image):
         else:
             test_img = cv2.rotate(small, cv2.ROTATE_90_COUNTERCLOCKWISE)
         
-        score, faces = get_rotation_score(test_img, DETECTION_CONFIDENCE)
+        score, count = count_faces_all_methods(test_img)
         
         if score > best_score:
             best_score = score
             best_angle = angle
-            best_faces = faces
+            best_count = count
     
-    return best_angle, best_score, best_faces
+    return best_angle, best_count
 
 
 def apply_rotation(image, angle):
-    """Apply rotation to image."""
-    if angle == 0:
-        return image
-    elif angle == 90:
+    """Apply 90-degree rotation."""
+    if angle == 90:
         return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
     elif angle == 180:
         return cv2.rotate(image, cv2.ROTATE_180)
@@ -428,7 +601,7 @@ def apply_rotation(image, angle):
 # ============================================================
 
 def save_photo(image, path):
-    """Save photo with slight auto-contrast enhancement."""
+    """Save photo with auto-contrast enhancement."""
     try:
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
@@ -436,7 +609,6 @@ def save_photo(image, path):
         pil_img.save(path, quality=95)
         return True
     except Exception as e:
-        print(f"  Error saving: {e}")
         return False
 
 
@@ -453,10 +625,10 @@ def process_scans():
     print(f"Output: {OUTPUT_DIR}")
     
     if TEST_MODE:
-        print(f"*** TEST MODE: Processing only {TEST_LIMIT} files ***")
+        print(f"*** TEST MODE: Processing {TEST_LIMIT} files ***")
     print()
-
-    # Find all input files
+    
+    # Find files
     extensions = ('*.png', '*.jpg', '*.jpeg', '*.tiff', '*.tif', '*.bmp')
     files = []
     for ext in extensions:
@@ -468,17 +640,16 @@ def process_scans():
         files = files[:TEST_LIMIT]
     
     total = len(files)
-    print(f"Found {total} scan files to process.")
-    print()
-
+    print(f"Found {total} scan files.\n")
+    
     if total == 0:
         print("No files to process!")
         return
-
+    
     start = time.time()
     extracted = 0
-    processed = 0
-
+    skipped = 0
+    
     pbar = tqdm(files, unit="scan", desc="Processing")
     
     for file_path in pbar:
@@ -490,43 +661,40 @@ def process_scans():
         out_folder = os.path.join(OUTPUT_DIR, rel)
         os.makedirs(out_folder, exist_ok=True)
         
-        # Skip if processed
-        if os.path.exists(os.path.join(out_folder, f"{base_name}_p1.png")):
-            pbar.set_postfix_str(f"Skip: {filename[:20]}")
-            continue
-        
         pbar.set_postfix_str(filename[:25])
         
-        # Load
+        # Load image
         img = cv2.imread(file_path)
         if img is None:
             pbar.write(f"  ✗ Could not load: {filename}")
             continue
         
-        # Find photos
+        # Find photos in scan
         photos = find_photos_in_scan(img)
         
         if not photos:
-            pbar.write(f"  ⚠ No photos found: {filename}")
+            skipped += 1
+            pbar.write(f"  ⚠ Skipped (no photos): {filename}")
             continue
         
         # Process each photo
         for i, photo in enumerate(photos, 1):
-            angle, score, faces = get_best_rotation(photo)
+            # Find best rotation
+            angle, face_count = find_best_rotation(photo)
+            
+            # Apply rotation
             final = apply_rotation(photo, angle)
             h, w = final.shape[:2]
             
-            if angle != 0:
-                pbar.write(f"  [{base_name} p{i}] Rotated {angle}° ({faces} faces) -> {w}x{h}")
-            else:
-                pbar.write(f"  [{base_name} p{i}] ({faces} faces) -> {w}x{h}")
+            # Log
+            rot_str = f"Rot {angle}°" if angle != 0 else "No rot"
+            pbar.write(f"  [{base_name} p{i}] {rot_str} ({face_count} faces) -> {w}x{h}")
             
+            # Save
             out_path = os.path.join(out_folder, f"{base_name}_p{i}.png")
             if save_photo(final, out_path):
                 extracted += 1
-        
-        processed += 1
-
+    
     pbar.close()
     
     elapsed = time.time() - start
@@ -534,9 +702,9 @@ def process_scans():
     print("=" * 60)
     print("COMPLETE")
     print("=" * 60)
-    print(f"Scans processed:  {processed}")
     print(f"Photos extracted: {extracted}")
-    print(f"Time: {elapsed:.1f}s ({elapsed/max(processed,1):.2f}s/scan)")
+    print(f"Scans skipped:    {skipped}")
+    print(f"Time: {elapsed:.1f}s")
 
 
 if __name__ == "__main__":
