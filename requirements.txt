@@ -3,3 +3,4 @@ numpy>=1.24.0
 tqdm>=4.65.0
 Pillow>=10.0.0
 onnxruntime-gpu>=1.16.0
+cupy-cuda12x>=13.0.0

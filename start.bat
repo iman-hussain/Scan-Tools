@@ -7,6 +7,11 @@ echo.
 
 cd /d "%~dp0"
 
+REM Add CUDA and cuDNN to PATH for this session
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+set "CUDNN_PATH=C:\Program Files\NVIDIA\CUDNN\v9.16\bin\12.9"
+set "PATH=%CUDA_PATH%\bin;%CUDA_PATH%\libnvvp;%CUDNN_PATH%;%PATH%"
+
 REM Check if venv exists
 if not exist "venv\Scripts\activate.bat" (
     echo Creating virtual environment...
