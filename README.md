@@ -21,7 +21,26 @@ GPU-accelerated batch processing for scanned photos. Automatically extracts, rot
 
 ## 🚀 Quick Start
 
-### 1. Clone or Download
+### 1. Install Prerequisites
+
+**Python 3.10+**
+- Download from [python.org](https://www.python.org/downloads/)
+- ✅ Check "Add Python to PATH" during installation
+
+**NVIDIA GPU Drivers & CUDA** (required for GPU acceleration)
+1. Install latest [NVIDIA GPU Drivers](https://www.nvidia.com/drivers)
+2. Install [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-downloads)
+   - Choose your Windows version
+   - Select "exe (local)" installer
+   - Default installation options are fine
+3. Install [cuDNN 9.x](https://developer.nvidia.com/cudnn-downloads)
+   - Requires free NVIDIA Developer account
+   - Choose "Windows" → "x86_64" → "exe (local)"
+   - Run the installer (installs automatically to CUDA folder)
+
+> 💡 **Tip:** After installing CUDA and cuDNN, restart your computer.
+
+### 2. Clone or Download
 
 ```bash
 git clone https://github.com/iman-hussain/Scan-Tools.git
@@ -30,7 +49,7 @@ cd Scan-Tools
 
 Or download and extract the ZIP.
 
-### 2. Add Your Scans
+### 3. Add Your Scans
 
 Place your scanned images in the `Input/` folder:
 
@@ -47,7 +66,7 @@ Input/
 
 **Supported formats:** PNG, JPG, JPEG, TIFF, TIF, BMP
 
-### 3. Run
+### 4. Run
 
 Double-click **`start.bat`**
 
@@ -56,7 +75,7 @@ That's it! The script will:
 2. Install all dependencies automatically
 3. Process your photos
 
-### 4. Get Your Photos
+### 5. Get Your Photos
 
 Processed photos appear in `Output/` with the same folder structure:
 
