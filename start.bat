@@ -1,16 +1,10 @@
 @echo off
 echo ============================================
-echo Photo Scanner Processing Script - Launcher
-echo GPU Accelerated with CUDA (RTX 2080Ti)
+echo Photo Scanner - GPU Accelerated
 echo ============================================
 echo.
 
 cd /d "%~dp0"
-
-REM Add CUDA and cuDNN to PATH for this session
-set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
-set "CUDNN_PATH=C:\Program Files\NVIDIA\CUDNN\v9.16\bin\12.9"
-set "PATH=%CUDA_PATH%\bin;%CUDA_PATH%\libnvvp;%CUDNN_PATH%;%PATH%"
 
 REM Check if venv exists
 if not exist "venv\Scripts\activate.bat" (
@@ -18,7 +12,7 @@ if not exist "venv\Scripts\activate.bat" (
     python -m venv venv
     if errorlevel 1 (
         echo ERROR: Failed to create virtual environment
-        echo Make sure Python is installed and in your PATH
+        echo Make sure Python 3.10+ is installed and in your PATH
         pause
         exit /b 1
     )
@@ -32,8 +26,8 @@ call venv\Scripts\activate.bat
 REM Check if requirements are installed (check for opencv)
 python -c "import cv2" 2>nul
 if errorlevel 1 (
-    echo Installing requirements...
-    pip install --upgrade pip
+    echo Installing requirements (this may take a few minutes)...
+    pip install --upgrade pip --quiet
     pip install -r requirements.txt
     if errorlevel 1 (
         echo ERROR: Failed to install requirements
@@ -47,7 +41,7 @@ if errorlevel 1 (
 REM Run the script
 echo Starting Photo Scanner...
 echo.
-python "Crop Split Rotate.py"
+python "Crop Split Rotate Upscale.py"
 
 echo.
 echo ============================================

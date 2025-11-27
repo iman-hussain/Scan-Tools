@@ -39,6 +39,7 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 # Config
 TEST_MODE = True  # Process all files
 TEST_LIMIT = 20
+UPSCALE_2X = True  # AI upscale photos by 2x using Real-ESRGAN
 
 print("=" * 60)
 print("PHOTO SCANNER v4.0")
@@ -114,6 +115,44 @@ except Exception as e:
 HAAR_FRONT = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 HAAR_PROFILE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
 print("  ✓ Haar Cascades")
+
+# Real-ESRGAN upscaler (2x, real photos - not anime)
+UPSCALER = None
+UPSCALER_DEVICE = None
+UPSCALER_SCALE = 2
+UPSCALER_TILE_SIZE = 512  # Process in tiles to save VRAM
+
+if UPSCALE_2X:
+    print("\nLoading AI upscaler...")
+    try:
+        import torch
+        import spandrel
+        
+        # Use RealESRGAN_x2plus - best for real photos at 2x
+        model_path = os.path.join(MODELS_DIR, "RealESRGAN_x2plus.pth")
+        model_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
+        
+        if not os.path.exists(model_path):
+            print("  Downloading RealESRGAN_x2plus model (67MB)...")
+            download_file(model_url, model_path)
+        
+        if os.path.exists(model_path):
+            # Use spandrel to load the model (no basicsr dependency issues)
+            UPSCALER_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model_descriptor = spandrel.ModelLoader().load_from_file(model_path)
+            UPSCALER = model_descriptor.model
+            UPSCALER_SCALE = model_descriptor.scale
+            UPSCALER = UPSCALER.eval().to(UPSCALER_DEVICE)
+            
+            # Use half precision on GPU for speed
+            if UPSCALER_DEVICE.type == 'cuda':
+                UPSCALER = UPSCALER.half()
+            
+            device_str = 'GPU (CUDA)' if UPSCALER_DEVICE.type == 'cuda' else 'CPU'
+            print(f"  ✓ Real-ESRGAN x{UPSCALER_SCALE} Upscaler ({device_str})")
+    except Exception as e:
+        print(f"  ✗ Real-ESRGAN: {e}")
+        UPSCALER = None
 
 print()
 
@@ -739,8 +778,76 @@ def detect_gradient_angle(gray):
 # MAIN PROCESSING
 # ============================================================
 
-def save_photo(image, path):
-    """Save photo with auto-contrast enhancement."""
+def upscale_photo(image):
+    """Upscale photo 2x using Real-ESRGAN AI with tiled processing."""
+    if UPSCALER is None:
+        return image
+    
+    try:
+        import torch
+        
+        h, w = image.shape[:2]
+        tile_size = UPSCALER_TILE_SIZE
+        tile_pad = 16  # Overlap for seamless blending
+        
+        # Output image (2x size)
+        scale = UPSCALER_SCALE
+        output = np.zeros((h * scale, w * scale, 3), dtype=np.uint8)
+        
+        # Process in tiles to save VRAM
+        for y in range(0, h, tile_size):
+            for x in range(0, w, tile_size):
+                # Calculate tile bounds with padding
+                y1 = max(0, y - tile_pad)
+                x1 = max(0, x - tile_pad)
+                y2 = min(h, y + tile_size + tile_pad)
+                x2 = min(w, x + tile_size + tile_pad)
+                
+                # Extract tile
+                tile = image[y1:y2, x1:x2]
+                
+                # Convert BGR to RGB, then to tensor
+                tile_rgb = cv2.cvtColor(tile, cv2.COLOR_BGR2RGB)
+                tile_tensor = torch.from_numpy(tile_rgb).permute(2, 0, 1).float() / 255.0
+                tile_tensor = tile_tensor.unsqueeze(0).to(UPSCALER_DEVICE)
+                
+                # Half precision on GPU
+                if UPSCALER_DEVICE.type == 'cuda':
+                    tile_tensor = tile_tensor.half()
+                
+                # Upscale
+                with torch.no_grad():
+                    upscaled_tensor = UPSCALER(tile_tensor)
+                
+                # Convert back to numpy
+                upscaled = upscaled_tensor.squeeze(0).permute(1, 2, 0).float().cpu().numpy()
+                upscaled = (upscaled * 255).clip(0, 255).astype(np.uint8)
+                upscaled = cv2.cvtColor(upscaled, cv2.COLOR_RGB2BGR)
+                
+                # Calculate output region (remove padding from result)
+                pad_y = (y - y1) * scale
+                pad_x = (x - x1) * scale
+                out_h = min(tile_size, h - y) * scale
+                out_w = min(tile_size, w - x) * scale
+                
+                # Copy to output (avoiding padding region)
+                output[y*scale:y*scale+out_h, x*scale:x*scale+out_w] = \
+                    upscaled[pad_y:pad_y+out_h, pad_x:pad_x+out_w]
+        
+        return output
+        
+    except Exception as e:
+        # Fall back to original if upscaling fails
+        print(f"      Upscale error: {e}")
+        return image
+
+
+def save_photo(image, path, do_upscale=True):
+    """Save photo with optional AI upscaling and auto-contrast."""
+    # Upscale if enabled
+    if do_upscale and UPSCALER is not None:
+        image = upscale_photo(image)
+    
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(rgb)
     pil_img = ImageOps.autocontrast(pil_img, cutoff=0.3)
@@ -817,16 +924,17 @@ def process_all():
             if best_angle != 0:
                 photo = apply_rotation(photo, best_angle)
             
-            # STEP 4: Save
+            # STEP 4: Save (with upscaling if enabled)
             out_path = os.path.join(out_folder, f"{basename}_p{i}.png")
-            save_photo(photo, out_path)
+            orig_h, orig_w = photo.shape[:2]
+            save_photo(photo, out_path, do_upscale=UPSCALE_2X)
             total_photos += 1
             
             # Log result
             scores_str = " ".join([f"{a}°:{s[0]:.1f}" for a, s in scores.items()])
-            h, w = photo.shape[:2]
             rot_str = f"→{best_angle}°" if best_angle != 0 else "OK"
-            pbar.write(f"  [{basename}_p{i}] {w}x{h} {rot_str} [{scores_str}]")
+            upscale_str = f" →{orig_w*2}x{orig_h*2}" if UPSCALE_2X and UPSCALER else ""
+            pbar.write(f"  [{basename}_p{i}] {orig_w}x{orig_h}{upscale_str} {rot_str} [{scores_str}]")
     
     pbar.close()
     

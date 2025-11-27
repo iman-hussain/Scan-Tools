@@ -1,9 +1,12 @@
 # Virtual environment
 venv/
 
-# Input/Output folders (contain user photos)
-Input/
-Output/
+# Input/Output folder contents (contain user photos)
+# Keep the folders themselves so users know where to put files
+Input/*
+Output/*
+!Input/.gitkeep
+!Output/.gitkeep
 
 # Downloaded ML models
 models/
