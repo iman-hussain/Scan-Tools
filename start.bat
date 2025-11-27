@@ -6,6 +6,22 @@ echo.
 
 cd /d "%~dp0"
 
+REM Auto-update from GitHub
+echo Checking for updates...
+powershell -ExecutionPolicy Bypass -Command ^
+    "$repo = 'iman-hussain/Scan-Tools'; ^
+    $files = @('Crop Split Rotate Upscale.py', 'requirements.txt'); ^
+    foreach ($file in $files) { ^
+        try { ^
+            $url = \"https://raw.githubusercontent.com/$repo/main/$file\"; ^
+            $temp = \"$file.tmp\"; ^
+            Invoke-WebRequest -Uri $url -OutFile $temp -UseBasicParsing -ErrorAction Stop; ^
+            if (Test-Path $temp) { Move-Item -Force $temp $file } ^
+        } catch { } ^
+    }; ^
+    Write-Host 'Up to date.'"
+echo.
+
 REM Check if venv exists
 if not exist "venv\Scripts\activate.bat" (
     echo Creating virtual environment...
