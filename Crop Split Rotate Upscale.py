@@ -39,7 +39,7 @@ MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Config
-TEST_MODE = False  # Process limited files for testing
+TEST_MODE = True  # Process limited files for testing
 TEST_LIMIT = 10
 UPSCALE_2X = True  # AI upscale photos by 2x using Real-ESRGAN
 PARALLEL_WORKERS = 8  # Number of parallel workers
@@ -102,12 +102,19 @@ try:
     import onnxruntime as ort
     ort.set_default_logger_severity(3)
     
-    # Force CPU-only for comparison test
-    providers = ['CPUExecutionProvider']
+    # Try to preload CUDA
+    try:
+        cuda_bin = os.path.join(os.environ.get("CUDA_PATH", ""), "bin")
+        if os.path.exists(cuda_bin):
+            ort.preload_dlls(cuda=True, cudnn=False, directory=cuda_bin)
+    except:
+        pass
+    
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
     
     if os.path.exists(ONNX_640_PATH):
         ONNX_SESSION = ort.InferenceSession(ONNX_640_PATH, providers=providers)
-        print("  ✓ UltraFace 640 (CPU)")
+        print("  ✓ UltraFace 640 (GPU)" if 'CUDAExecutionProvider' in ort.get_available_providers() else "  ✓ UltraFace 640")
 except Exception as e:
     print(f"  ✗ ONNX: {e}")
 
@@ -997,3 +1004,4 @@ def process_all():
 
 if __name__ == "__main__":
     process_all()
+
